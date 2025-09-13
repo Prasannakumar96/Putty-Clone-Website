@@ -18,12 +18,63 @@ import paramiko
 import threading
 import time
 
+import uuid
+import json
+
+from flask import jsonify
+
+def load_profiles():
+    if not os.path.exists(PROFILES_JSON):
+        return []
+    try:
+        with open(PROFILES_JSON, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_profiles(items):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PROFILES_JSON, "w") as f:
+        json.dump(items, f, indent=2)
+
+def save_uploaded_key(file_storage):
+    # Returns saved path (relative) or None
+    if not file_storage or not file_storage.filename:
+        return None
+    data = file_storage.read()
+    if len(data) > MAX_KEY_SIZE:
+        raise RuntimeError("Key file too large")
+    ext = ".ppk" if file_storage.filename.lower().endswith(".ppk") else ".pem"
+    fname = f"{uuid.uuid4().hex}{ext}"
+    path = os.path.join(KEYS_DIR, fname)
+    with open(path, "wb") as f:
+        f.write(data)
+    return os.path.join("keys", fname)
+
+def build_pkey_from_path(rel_path, passphrase: Optional[str]):
+    # Load key from saved path, auto-convert if .ppk
+    full = os.path.join(DATA_DIR, rel_path)
+    with open(full, "rb") as f:
+        data = f.read()
+    if rel_path.lower().endswith(".ppk"):
+        data = convert_ppk_to_openssh(data, passphrase if passphrase else None)
+    return load_pkey_from_bytes(data, passphrase if passphrase else None)
+
+
 # ---- Config ----
+
 APP_HOST = "127.0.0.1"
 APP_PORT = 5000
 MAX_KEY_SIZE = 1024 * 1024  # 1 MB
 LOG_DIR = "logs"
 LOG_FILE = os.path.join(LOG_DIR, "app.log")
+
+
+DATA_DIR = "data"
+KEYS_DIR = os.path.join(DATA_DIR, "keys")
+PROFILES_JSON = os.path.join(DATA_DIR, "profiles.json")
+os.makedirs(KEYS_DIR, exist_ok=True)
+
 
 app = Flask(__name__)
 sock = Sock(app)
@@ -53,111 +104,189 @@ log = logging.getLogger("webssh")
 
 INDEX_HTML = """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Web SSH</title>
-  <style>
-    :root { --pad: 16px; --hdr: 48px; }
-    html, body { height: 100%; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0; }
-    .container { max-width: 960px; margin: 24px auto; padding: 0 var(--pad); }
-    .card { border: 1px solid #ddd; border-radius: 8px; padding: var(--pad); }
-    label { display: block; margin-top: 10px; font-weight: 600; }
-    input, select { width: 100%; padding: 8px; margin-top: 6px; }
-    .row { display: flex; gap: 12px; }
-    .col { flex: 1; }
-    .btn { margin-top: 16px; padding: 10px 14px; background: #0b5ed7; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
-    .btn.secondary { background: #555; }
-    .btn.warn { background: #c0392b; }
-    .btn.ghost { background: #2d3436; }
-    .btn:disabled { background: #9bbaf0; }
-    .note { color: #555; font-size: 0.9em; }
-    #terminal { width: 100%; height: 70vh; background: #000; color: #fff; margin-top: var(--pad); border-radius: 8px; overflow: hidden; }
-    .hidden { display: none; }
-    .row-inline { display:flex; gap: 8px; align-items:center; flex-wrap: wrap; }
-    .row-inline a { text-decoration: none; }
-    /* Fullscreen overlay just for terminal */
-    #fsOverlay.hidden { display: none; }
-    #fsOverlay {
-      position: fixed; inset: 0;
-      background: #111; z-index: 9999; display: flex; flex-direction: column;
-    }
-    #fsHeader {
-      height: var(--hdr); min-height: var(--hdr); display: flex; align-items: center; justify-content: space-between;
-      padding: 0 var(--pad); color: #fff; background: #0b5ed7;
-      font-weight: 600;
-    }
-    #fsHeader .info { display: flex; align-items: baseline; gap: 12px; }
-    #fsHeader .info .dim { opacity: 0.85; font-weight: 500; }
-    #fsHeader .actions { display: flex; gap: 8px; }
-    #fsHeader .actions .btn { margin-top: 0; border-radius: 6px; }
-    #fsTerminalWrap { flex: 1; padding: 8px; }
-    #terminalFS {
-      width: 100%; height: calc(100vh - var(--hdr) - 16px);
-      background: #000; color: #fff; border-radius: 6px; overflow: hidden;
-    }
-  </style>
   <link rel="stylesheet" href="https://unpkg.com/xterm/css/xterm.css" />
   <script src="https://unpkg.com/xterm/lib/xterm.js"></script>
   <script src="https://unpkg.com/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+  <style>
+    :root {
+      --sidebar-w: 30vw;
+      --content-w: 70vw;
+      --gap: 16px;
+      --pad: 14px;
+      --hdr: 48px;
+      --radius: 12px;
+      --border: #e5e7eb;
+      --muted: #6b7280;
+      --bg: #ffffff;
+      --bg-soft: #f9fafb;
+      --fg: #111827;
+      --accent: #0b5ed7;
+      --danger: #c0392b;
+      --dark: #0b0b0b;
+    }
+    html, body { height: 100%; }
+    body {
+      margin: 0; color: var(--fg); background: var(--bg-soft);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    .shell {
+      display: grid;
+      grid-template-columns: var(--sidebar-w) var(--content-w);
+      height: 100vh;
+      overflow: hidden;
+    }
+    .sidebar {
+      background: var(--bg);
+      border-right: 1px solid var(--border);
+      padding: var(--pad);
+      display: flex; flex-direction: column; gap: var(--gap);
+      position: sticky; top: 0; height: 100vh; overflow: auto;
+    }
+    .content {
+      height: 100vh;
+      overflow: auto;
+      padding: var(--pad);
+    }
+    .section { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--pad); }
+    h2, h3 { margin: 0 0 8px 0; font-weight: 700; }
+    .stack { display: grid; gap: 10px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .note { color: var(--muted); font-size: .95rem; }
+    input, select, button, a.button {
+      font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: #fff;
+    }
+    input:focus, select:focus, button:focus, a.button:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+    button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+    button.secondary { background: #374151; color: #fff; border-color: #374151; }
+    button.ghost { background: #2d3436; color: #fff; border-color: #2d3436; }
+    button.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+    button[disabled] { opacity: .6; cursor: not-allowed; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+
+    #connectPanel, #termCard { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--pad); }
+    #terminal, #terminalFS {
+      width: 100%; height: 72vh; background: var(--dark); color: #f3f3f3;
+      border-radius: 10px; overflow: hidden; border: 1px solid #1c1c1c;
+    }
+    .hidden { display: none !important; }
+
+    .accordion { display: grid; gap: 8px; }
+    details.ac-item {
+      border: 1px solid var(--border); border-radius: 10px; background: #fff;
+    }
+    details.ac-item[open] { box-shadow: 0 2px 10px rgba(0,0,0,.04); }
+    summary.ac-summary {
+      cursor: pointer; list-style: none; padding: 10px 12px; display: flex; align-items: center; justify-content: space-between;
+    }
+    summary.ac-summary::-webkit-details-marker { display: none; }
+    .ac-meta { display: grid; gap: 4px; }
+    .ac-name { font-weight: 600; }
+    .ac-sub { color: var(--muted); font-size: .92rem; }
+    .ac-actions { padding: 10px 12px; border-top: 1px solid var(--border); display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .connection-info {
+      background: #f0f9ff; border: 1px solid #0ea5e9; border-radius: 10px; padding: 12px;
+      margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between;
+    }
+    .connection-info .status { font-weight: 600; color: #0ea5e9; }
+
+    #fsOverlay.hidden { display: none; }
+    #fsOverlay {
+      position: fixed; inset: 0; z-index: 9999; display: flex; flex-direction: column; background: #0e0f12;
+    }
+    #fsHeader {
+      height: var(--hdr); min-height: var(--hdr); display: flex; align-items: center; justify-content: space-between;
+      padding: 0 12px; background: var(--accent); color: #fff; border-bottom: 1px solid rgba(255,255,255,.15);
+      position: sticky; top: 0;
+    }
+    #fsHeader .info { display: flex; gap: 10px; align-items: baseline; }
+    #fsHeader .dim { opacity: .9; }
+    #fsTerminalWrap { flex: 1; padding: 10px; }
+    #terminalFS { height: calc(100vh - var(--hdr) - 20px); }
+  </style>
 </head>
 <body>
-  <div id="wrap" class="container">
-    <h2>Web SSH (PuTTY-like)</h2>
-    <div class="card">
-      <form id="connForm" enctype="multipart/form-data">
-        <div class="row">
-          <div class="col">
-            <label>Host/IP</label>
-            <input name="host" required placeholder="e.g. 203.0.113.10">
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="section">
+        <div class="actions" style="justify-content: space-between; align-items:center;">
+          <h3 style="margin:0;">Saved Clients</h3>
+          <button id="refreshBtn" class="ghost" type="button">Refresh</button>
+        </div>
+        <div id="accordion" class="accordion" style="margin-top:10px;"></div>
+      </div>
+
+      <div class="section">
+        <button id="newConnectionBtn" class="primary" type="button" style="width:100%;">+ New Connection</button>
+        <p class="note" style="margin-top:8px;">Create a new SSH connection or manage saved clients above.</p>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div id="connectPanel">
+        <h2>Connect to SSH Server</h2>
+        <form id="connForm" enctype="multipart/form-data" class="stack">
+          <div class="row">
+            <label>Host/IP <input name="host" placeholder="203.0.113.10" required></label>
+            <label>Port <input name="port" type="number" value="22" required></label>
           </div>
-          <div class="col">
-            <label>Port</label>
-            <input name="port" type="number" value="22" required>
+          <div class="row">
+            <label>Username <input name="username" placeholder="ubuntu" required></label>
+            <label>Password (optional) <input name="password" type="password"></label>
+          </div>
+          <label>Private key (.pem or .ppk) <input name="pkey" type="file" accept=".pem,.ppk,.key,.txt"></label>
+          <label>Key passphrase <input name="passphrase" type="password"></label>
+          <p class="note">.ppk converts via puttygen (brew install putty). Use Test only first. View logs for details.</p>
+          <div class="actions">
+            <button id="connectBtn" class="primary" type="submit">Connect</button>
+            <button id="testBtn" class="secondary" type="button">Test only</button>
+            <a class="button" href="/logs" target="_blank">View logs</a>
+          </div>
+          <hr>
+          <h3>Save as Client</h3>
+          <div class="row">
+            <label>Client name <input name="client_name" placeholder="Prod-EC2-1"></label>
+            <label>Save password?
+              <select name="save_password">
+                <option value="no" selected>No</option>
+                <option value="yes">Yes (plain JSON)</option>
+              </select>
+            </label>
+          </div>
+          <p class="note">Keys saved under data/keys and referenced in profiles.json.</p>
+          <div class="actions">
+            <button id="saveClientBtn" class="button" type="button">Save/Update</button>
+          </div>
+        </form>
+      </div>
+
+      <div id="termCard" class="hidden">
+        <div class="connection-info">
+          <div class="status" id="connectionStatus">Connected to server</div>
+          <div class="actions">
+            <button id="fullscreenBtn" class="ghost" type="button">Fullscreen</button>
+            <button id="disconnectBtn" class="danger" type="button">Disconnect</button>
           </div>
         </div>
-        <div class="row">
-          <div class="col">
-            <label>Username</label>
-            <input name="username" required placeholder="e.g. ubuntu">
-          </div>
-          <div class="col">
-            <label>Password (optional if using key)</label>
-            <input name="password" type="password" placeholder="">
-          </div>
-        </div>
-        <label>Private key (OpenSSH .pem or PuTTY .ppk)</label>
-        <input name="pkey" type="file" accept=".pem,.ppk,.key,.txt">
-        <label>Key passphrase (if the private key is encrypted)</label>
-        <input name="passphrase" type="password">
-        <p class="note">
-          .ppk will be converted via puttygen; install with: brew install putty. Use “Test only” first; check “View logs” for details if it fails.
-        </p>
-        <div class="row-inline">
-          <button class="btn" type="submit" id="connectBtn">Connect</button>
-          <button class="btn secondary" type="button" id="testBtn" title="Test credentials without opening a terminal">Test only</button>
-          <button class="btn warn hidden" type="button" id="disconnectBtn">Disconnect</button>
-          <button class="btn ghost hidden" type="button" id="fullscreenBtn">Fullscreen</button>
-          <a class="note" href="/logs" target="_blank">View logs</a>
-        </div>
-      </form>
-    </div>
-    <div id="termCard" class="card hidden">
-      <div id="terminal"></div>
-    </div>
+        <div id="terminal"></div>
+      </div>
+    </main>
   </div>
 
-  <!-- Fullscreen overlay just for the terminal pane -->
-  <div id="fsOverlay" class="hidden">
+  <div id="fsOverlay" class="hidden" role="dialog" aria-modal="true" aria-label="Terminal Fullscreen">
     <div id="fsHeader">
       <div class="info">
-        <div>Connected:</div>
-        <div id="fsUserHost" class="dim"></div>
+        <strong>Connected:</strong><span id="fsUserHost" class="dim"></span>
       </div>
       <div class="actions">
-        <button class="btn warn" type="button" id="fsDisconnectBtn">Disconnect</button>
-        <button class="btn secondary" type="button" id="fsExitBtn">Leave Fullscreen</button>
+        <button id="fsDisconnectBtn" class="danger" type="button">Disconnect</button>
+        <button id="fsExitBtn" class="secondary" type="button">Leave Fullscreen</button>
       </div>
     </div>
     <div id="fsTerminalWrap">
@@ -167,7 +296,13 @@ INDEX_HTML = """
 
   <script>
     const fitAddon = new window.FitAddon.FitAddon();
-    const term = new window.Terminal({ cursorBlink: true, convertEol: true, fontSize: 14 });
+    const term = new window.Terminal({ 
+      cursorBlink: true, 
+      convertEol: true, 
+      fontSize: 14, 
+      theme: { background: '#0b0b0b' },
+      disableStdin: false
+    });
     term.loadAddon(fitAddon);
 
     const form = document.getElementById('connForm');
@@ -175,7 +310,13 @@ INDEX_HTML = """
     const testBtn = document.getElementById('testBtn');
     const disconnectBtn = document.getElementById('disconnectBtn');
     const fullscreenBtn = document.getElementById('fullscreenBtn');
+    const connectPanel = document.getElementById('connectPanel');
     const termCard = document.getElementById('termCard');
+    const accordion = document.getElementById('accordion');
+    const refreshBtn = document.getElementById('refreshBtn');
+    const saveClientBtn = document.getElementById('saveClientBtn');
+    const newConnectionBtn = document.getElementById('newConnectionBtn');
+    const connectionStatus = document.getElementById('connectionStatus');
 
     const fsOverlay = document.getElementById('fsOverlay');
     const fsUserHost = document.getElementById('fsUserHost');
@@ -190,32 +331,28 @@ INDEX_HTML = """
     let lastUser = '';
     let lastHost = '';
     let lastPort = '22';
+    let dataHandler = null;
 
-    function updateUI(connected) {
-      disconnectBtn.classList.toggle('hidden', !connected);
-      fullscreenBtn.classList.toggle('hidden', !connected);
-      termCard.classList.toggle('hidden', !connected);
-      connectBtn.disabled = connected;
-      testBtn.disabled = connected;
+    function showConnectPanel() {
+      connectPanel.classList.remove('hidden');
+      termCard.classList.add('hidden');
     }
 
-    function openTerminalInNormalPane() {
-      // Mount terminal into normal card
-      if (!term.element || term.element.parentElement !== terminalNormal) {
-        terminalNormal.innerHTML = '';
-        term.open(terminalNormal);
+    function showTerminalPanel(connectionInfo = '') {
+      connectPanel.classList.add('hidden');
+      termCard.classList.remove('hidden');
+      if (connectionInfo) {
+        connectionStatus.textContent = connectionInfo;
       }
-      setTimeout(() => fitAddon.fit(), 50);
-      term.focus();
     }
 
-    function openTerminalInFullscreenPane() {
-      // Move terminal into fullscreen container
-      if (!term.element || term.element.parentElement !== terminalFS) {
-        terminalFS.innerHTML = '';
-        term.open(terminalFS);
+    function mountTerminal(hostFS=false) {
+      const target = hostFS ? terminalFS : terminalNormal;
+      if (!term.element || term.element.parentElement !== target) {
+        target.innerHTML = '';
+        term.open(target);
       }
-      setTimeout(() => fitAddon.fit(), 50);
+      setTimeout(() => fitAddon.fit(), 40);
       term.focus();
     }
 
@@ -226,32 +363,47 @@ INDEX_HTML = """
       ws = new WebSocket(wsUrl);
 
       ws.onopen = () => {
-        openTerminalInNormalPane();
+        showTerminalPanel(`Connected to ${lastUser}@${lastHost}:${lastPort}`);
+        mountTerminal(false);
         term.write("\\x1b[32mConnected.\\x1b[0m\\r\\n");
         window.addEventListener('resize', () => fitAddon.fit());
-        updateUI(true);
+        
+        // Remove any existing data handler to prevent duplicates
+        if (dataHandler) {
+          term.onData.dispose();
+        }
+        
+        // Set up input handler - only send to WebSocket, don't echo locally
+        dataHandler = term.onData((data) => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(data);
+          }
+        });
       };
-
-      ws.onmessage = (ev) => term.write(ev.data);
-
+      
+      ws.onmessage = (ev) => {
+        // Only write server output to terminal, no local echo
+        term.write(ev.data);
+      };
+      
       ws.onclose = () => {
         term.write("\\r\\n\\x1b[31mDisconnected.\\x1b[0m\\r\\n");
-        updateUI(false);
+        showConnectPanel();
         if (inFullscreen) exitFullscreen();
         currentSid = null;
+        
+        // Clean up data handler
+        if (dataHandler) {
+          dataHandler.dispose();
+          dataHandler = null;
+        }
       };
-
-      term.onData((d) => {
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send(d);
-      });
     }
 
     async function disconnectSession() {
       try { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); } catch (e) {}
-      if (currentSid) {
-        try { await fetch(`/close?sid=${encodeURIComponent(currentSid)}`, { method: 'POST' }); } catch (e) {}
-      }
-      updateUI(false);
+      if (currentSid) { try { await fetch(`/close?sid=${encodeURIComponent(currentSid)}`, { method: 'POST' }); } catch (e) {} }
+      showConnectPanel();
       if (inFullscreen) exitFullscreen();
     }
 
@@ -259,22 +411,80 @@ INDEX_HTML = """
       inFullscreen = true;
       fsUserHost.textContent = `${lastUser}@${lastHost}:${lastPort}`;
       fsOverlay.classList.remove('hidden');
-      openTerminalInFullscreenPane();
+      mountTerminal(true);
     }
-
     function exitFullscreen() {
       inFullscreen = false;
       fsOverlay.classList.add('hidden');
-      openTerminalInNormalPane();
+      mountTerminal(false);
     }
+
+    async function renderAccordion() {
+      const res = await fetch('/profiles');
+      const items = await res.json();
+      accordion.innerHTML = '';
+      if (!items.length) {
+        accordion.innerHTML = '<div class="note">No saved clients yet.</div>';
+        return;
+      }
+      for (const it of items) {
+        const el = document.createElement('details');
+        el.className = 'ac-item';
+        const id = it.id;
+        el.innerHTML = `
+          <summary class="ac-summary" aria-controls="panel-${id}">
+            <div class="ac-meta">
+              <div class="ac-name">${it.name}</div>
+              <div class="ac-sub">${it.username}@${it.host}:${it.port} ${it.key_path ? '(key)' : (it.password ? '(password)' : '')}</div>
+            </div>
+            <span aria-hidden="true">▸</span>
+          </summary>
+          <div id="panel-${id}" class="ac-actions" role="region" aria-labelledby="summary-${id}">
+            <button class="primary" data-connect="${id}">Connect</button>
+            <button class="danger" data-del="${id}">Delete</button>
+          </div>
+        `;
+        const caret = el.querySelector('span[aria-hidden="true"]');
+        el.addEventListener('toggle', () => { caret.textContent = el.open ? '▾' : '▸'; });
+
+        el.querySelector('[data-connect]').addEventListener('click', async () => {
+          lastUser = it.username; lastHost = it.host; lastPort = String(it.port);
+          const r = await fetch('/connect_profile', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id })
+          });
+          const txt = await r.text();
+          if (!r.ok) { alert('Error: ' + txt); return; }
+          const { sessionId } = JSON.parse(txt);
+          connectWS(sessionId);
+        });
+        el.querySelector('[data-del]').addEventListener('click', async () => {
+          if (!confirm('Delete this client?')) return;
+          const r = await fetch('/profiles/delete', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id })
+          });
+          if (!r.ok) { alert('Delete failed'); return; }
+          renderAccordion();
+        });
+
+        accordion.appendChild(el);
+      }
+    }
+
+    newConnectionBtn.addEventListener('click', () => showConnectPanel());
+    fullscreenBtn.addEventListener('click', () => { if (currentSid) enterFullscreen(); });
+    fsExitBtn.addEventListener('click', () => exitFullscreen());
+    fsDisconnectBtn.addEventListener('click', () => disconnectSession());
+    disconnectBtn.addEventListener('click', () => disconnectSession());
+
+    refreshBtn.addEventListener('click', renderAccordion);
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      // Cache current user/host for header
       lastUser = (form.username.value || '').trim();
       lastHost = (form.host.value || '').trim();
       lastPort = (form.port.value || '22').trim();
-
       const fd = new FormData(form);
       const res = await fetch('/start', { method: 'POST', body: fd });
       const txt = await res.text();
@@ -291,20 +501,20 @@ INDEX_HTML = """
       alert('Test OK: ' + txt);
     });
 
-    fullscreenBtn.addEventListener('click', () => {
-      if (!currentSid) return;
-      enterFullscreen();
+    saveClientBtn.addEventListener('click', async () => {
+      const name = (form.client_name.value || '').trim();
+      if (!name) return alert('Enter a Client name');
+      const fd = new FormData(form);
+      fd.append('name', name);
+      fd.append('want_save_password', (form.save_password.value || 'no'));
+      const res = await fetch('/profiles', { method: 'POST', body: fd });
+      const txt = await res.text();
+      if (!res.ok) { alert('Save failed: ' + txt); return; }
+      alert('Saved');
+      renderAccordion();
     });
 
-    fsExitBtn.addEventListener('click', () => {
-      exitFullscreen();
-    });
-
-    fsDisconnectBtn.addEventListener('click', () => {
-      disconnectSession();
-    });
-
-    disconnectBtn.addEventListener('click', disconnectSession);
+    renderAccordion();
   </script>
 </body>
 </html>
@@ -528,6 +738,111 @@ def close_session():
     except Exception:
         pass
     return Response("ok", status=200)
+
+
+@app.get("/profiles")
+def profiles_list():
+    return jsonify(load_profiles())
+
+@app.post("/profiles")
+def profiles_add():
+    name = request.form.get("name", "").strip()
+    host = request.form.get("host", "").strip()
+    port = int(request.form.get("port", "22"))
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    passphrase = request.form.get("passphrase", "")
+    want_save_password = (request.form.get("save_password", "no").lower() == "yes")
+
+    if not name or not host or not username:
+        return Response("name, host, username required", status=400)
+
+    key_file = request.files.get("pkey")
+    key_path = None
+    try:
+        key_path = save_uploaded_key(key_file) if key_file and key_file.filename else None
+    except Exception as e:
+        return Response(f"Key save error: {e}", status=400)
+
+    items = load_profiles()
+    # update if name exists, else add new
+    existing = next((x for x in items if x.get("name") == name), None)
+    payload = {
+        "id": existing["id"] if existing else uuid.uuid4().hex,
+        "name": name,
+        "host": host,
+        "port": port,
+        "username": username,
+        "key_path": key_path if key_path else (existing.get("key_path") if existing else None),
+        "passphrase": passphrase if passphrase else "",  # optional; plain text in demo
+        "password": (password if want_save_password else ""),
+    }
+    if existing:
+        # merge update
+        existing.update(payload)
+    else:
+        items.append(payload)
+
+    save_profiles(items)
+    return Response("ok", status=200)
+
+@app.post("/profiles/delete")
+def profiles_delete():
+    data = request.get_json(silent=True) or {}
+    pid = data.get("id", "")
+    items = load_profiles()
+    new_items = [x for x in items if x.get("id") != pid]
+    if len(new_items) == len(items):
+        return Response("not found", status=404)
+    save_profiles(new_items)
+    return Response("ok", status=200)
+
+@app.post("/connect_profile")
+def connect_profile():
+    data = request.get_json(silent=True) or {}
+    pid = data.get("id", "")
+    items = load_profiles()
+    p = next((x for x in items if x.get("id") == pid), None)
+    if not p:
+        return Response("profile not found", status=404)
+
+    pkey_obj = None
+    try:
+        if p.get("key_path"):
+            pkey_obj = build_pkey_from_path(p["key_path"], p.get("passphrase") or "")
+    except Exception as e:
+        return Response(f"Key error: {e}", status=400)
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            hostname=p["host"],
+            port=int(p.get("port", 22)),
+            username=p["username"],
+            password=(p.get("password") or None),
+            pkey=pkey_obj,
+            allow_agent=True,
+            look_for_keys=False,
+            timeout=20,
+            auth_timeout=20,
+            banner_timeout=20,
+        )
+    except Exception as e:
+        return Response(f"SSH connect error: {e}", status=400)
+
+    try:
+        chan = client.invoke_shell(term='xterm', width=120, height=30)
+        chan.settimeout(0.0)
+    except Exception as e:
+        try: client.close()
+        except Exception: pass
+        return Response(f"Failed to open shell: {e}", status=400)
+
+    session_id = os.urandom(16).hex()
+    with sessions_lock:
+        sessions[session_id] = SSHSession(client=client, channel=chan)
+    return Response(json.dumps({"sessionId": session_id}), mimetype="application/json")
 
 @sock.route("/ws")
 def ws(ws):
